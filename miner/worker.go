@@ -25,10 +25,10 @@ import (
 	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
-	lru "github.com/hashicorp/golang-lru"
 	"github.com/holiman/uint256"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
@@ -40,6 +40,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
@@ -93,7 +94,7 @@ var (
 type environment struct {
 	signer   types.Signer
 	state    *state.StateDB // apply state changes here
-	tcount   int            // tx count in cycle
+	tcount   int            // count of non-system transactions in cycle
 	gasPool  *core.GasPool  // available gas used to pack transactions
 	coinbase common.Address
 	evm      *vm.EVM
@@ -105,17 +106,20 @@ type environment struct {
 	blobs    int
 
 	witness *stateless.Witness
+
+	committed bool
 }
 
 // copy creates a deep copy of environment.
 func (env *environment) copy() *environment {
 	cpy := &environment{
-		signer:   env.signer,
-		state:    env.state.Copy(),
-		tcount:   env.tcount,
-		coinbase: env.coinbase,
-		header:   types.CopyHeader(env.header),
-		receipts: copyReceipts(env.receipts),
+		signer:    env.signer,
+		state:     env.state.Copy(),
+		tcount:    env.tcount,
+		coinbase:  env.coinbase,
+		header:    types.CopyHeader(env.header),
+		receipts:  copyReceipts(env.receipts),
+		committed: env.committed,
 	}
 	if env.gasPool != nil {
 		gasPool := *env.gasPool
@@ -250,11 +254,10 @@ type worker struct {
 	skipSealHook      func(*task) bool                   // Method to decide whether skipping the sealing.
 	fullTaskHook      func()                             // Method to call before pushing the full sealing task.
 	resubmitHook      func(time.Duration, time.Duration) // Method to call upon updating resubmitting interval.
-	recentMinedBlocks *lru.Cache
+	recentMinedBlocks *lru.Cache[uint64, []common.Hash]
 }
 
 func newWorker(config *minerconfig.Config, engine consensus.Engine, eth Backend, mux *event.TypeMux, init bool) *worker {
-	recentMinedBlocks, _ := lru.New(recentMinedCacheLimit)
 	chainConfig := eth.BlockChain().Config()
 	worker := &worker{
 		prefetcher:         core.NewStatePrefetcher(chainConfig, eth.BlockChain().HeadChain()),
@@ -276,7 +279,7 @@ func newWorker(config *minerconfig.Config, engine consensus.Engine, eth Backend,
 		startCh:            make(chan struct{}, 1),
 		exitCh:             make(chan struct{}),
 		resubmitIntervalCh: make(chan time.Duration),
-		recentMinedBlocks:  recentMinedBlocks,
+		recentMinedBlocks:  lru.NewCache[uint64, []common.Hash](recentMinedCacheLimit),
 	}
 	// Subscribe events for blockchain
 	worker.chainHeadSub = eth.BlockChain().SubscribeChainHeadEvent(worker.chainHeadCh)
@@ -308,6 +311,10 @@ func newWorker(config *minerconfig.Config, engine consensus.Engine, eth Backend,
 
 func (w *worker) setBestBidFetcher(fetcher bidFetcher) {
 	w.bidFetcher = fetcher
+}
+
+func (w *worker) getPrefetcher() core.Prefetcher {
+	return w.prefetcher
 }
 
 // setEtherbase sets the etherbase used to initialize the block coinbase field.
@@ -635,7 +642,7 @@ func (w *worker) resultLoop() {
 
 			if prev, ok := w.recentMinedBlocks.Get(block.NumberU64()); ok {
 				doubleSign := false
-				prevParents, _ := prev.([]common.Hash)
+				prevParents := prev
 				for _, prevParent := range prevParents {
 					if prevParent == block.ParentHash() {
 						log.Error("Reject Double Sign!!", "block", block.NumberU64(),
@@ -658,9 +665,8 @@ func (w *worker) resultLoop() {
 			}
 
 			// Commit block and state to database.
-			task.state.SetExpectedStateRoot(block.Root())
 			start := time.Now()
-			status, err := w.chain.WriteBlockAndSetHead(block, receipts, logs, task.state, true)
+			status, err := w.chain.WriteBlockAndSetHead(block, receipts, logs, task.state, w.mux)
 			if status != core.CanonStatTy {
 				if err != nil {
 					log.Error("Failed writing block to chain", "err", err, "status", status)
@@ -673,7 +679,7 @@ func (w *worker) resultLoop() {
 			stats := w.chain.GetBlockStats(block.Hash())
 			stats.SendBlockTime.Store(time.Now().UnixMilli())
 			stats.StartMiningTime.Store(task.miningStartAt.UnixMilli())
-			log.Info("Successfully sealed new block", "number", block.Number(), "sealhash", sealhash, "hash", hash,
+			log.Info("Successfully seal and write new block", "number", block.Number(), "sealhash", sealhash, "hash", hash,
 				"elapsed", common.PrettyDuration(time.Since(task.createdAt)))
 			w.mux.Post(core.NewMinedBlockEvent{Block: block})
 
@@ -920,6 +926,24 @@ LOOP:
 			txs.Pop()
 			continue
 		}
+
+		// Make sure all transactions after osaka have cell proofs
+		if w.chainConfig.IsOsaka(env.header.Number, env.header.Time) {
+			if sidecar := tx.BlobTxSidecar(); sidecar != nil {
+				if sidecar.Version == 0 {
+					log.Info("Including blob tx with v0 sidecar, recomputing proofs", "hash", ltx.Hash)
+					sidecar.Proofs = make([]kzg4844.Proof, 0, len(sidecar.Blobs)*kzg4844.CellProofsPerBlob)
+					for _, blob := range sidecar.Blobs {
+						cellProofs, err := kzg4844.ComputeCellProofs(&blob)
+						if err != nil {
+							panic(err)
+						}
+						sidecar.Proofs = append(sidecar.Proofs, cellProofs...)
+					}
+				}
+			}
+		}
+
 		// Error may be ignored here. The error has already been checked
 		// during transaction acceptance in the transaction pool.
 		from, _ := types.Sender(env.signer, tx)
@@ -1197,9 +1221,13 @@ func (w *worker) generateWork(params *generateParams, witness bool) *newPayloadR
 			return &newPayloadResult{err: err}
 		}
 		// EIP-7002
-		core.ProcessWithdrawalQueue(&requests, work.evm)
+		if err := core.ProcessWithdrawalQueue(&requests, work.evm); err != nil {
+			return &newPayloadResult{err: err}
+		}
 		// EIP-7251 consolidations
-		core.ProcessConsolidationQueue(&requests, work.evm)
+		if err := core.ProcessConsolidationQueue(&requests, work.evm); err != nil {
+			return &newPayloadResult{err: err}
+		}
 	}
 	if requests != nil {
 		reqHash := types.CalcRequestsHash(requests)
@@ -1253,6 +1281,7 @@ func (w *worker) commitWork(interruptCh chan int32, timestamp int64) {
 	// validator can try several times to get the most profitable block,
 	// as long as the timestamp is not reached.
 	workList := make([]*environment, 0, 10)
+	parentHash := w.chain.CurrentBlock().Hash()
 	var prevWork *environment
 	// workList clean up
 	defer func() {
@@ -1268,9 +1297,10 @@ func (w *worker) commitWork(interruptCh chan int32, timestamp int64) {
 LOOP:
 	for {
 		work, err := w.prepareWork(&generateParams{
-			timestamp: uint64(timestamp),
-			coinbase:  coinbase,
-			prevWork:  prevWork,
+			timestamp:  uint64(timestamp),
+			parentHash: parentHash,
+			coinbase:   coinbase,
+			prevWork:   prevWork,
 		}, false)
 		if err != nil {
 			return
@@ -1472,6 +1502,10 @@ func (w *worker) inTurn() bool {
 // the deep copy first.
 func (w *worker) commit(env *environment, interval func(), update bool, start time.Time) error {
 	if w.isRunning() {
+		if env.committed {
+			log.Warn("Invalid work commit: already committed", "number", env.header.Number.Uint64())
+			return nil
+		}
 		if interval != nil {
 			interval()
 		}
@@ -1484,6 +1518,7 @@ func (w *worker) commit(env *environment, interval func(), update bool, start ti
 			body.Withdrawals = make([]*types.Withdrawal, 0)
 		}
 		block, receipts, err := w.engine.FinalizeAndAssemble(w.chain, types.CopyHeader(env.header), env.state, &body, env.receipts, nil)
+		env.committed = true
 		if err != nil {
 			return err
 		}
@@ -1504,7 +1539,7 @@ func (w *worker) commit(env *environment, interval func(), update bool, start ti
 		select {
 		case w.taskCh <- &task{receipts: receipts, state: env.state, block: block, createdAt: time.Now(), miningStartAt: start}:
 			log.Info("Commit new sealing work", "number", block.Number(), "sealhash", w.engine.SealHash(block.Header()),
-				"txs", env.tcount, "blobs", env.blobs, "gas", block.GasUsed(), "fees", feesInEther, "elapsed", common.PrettyDuration(time.Since(start)))
+				"txs", len(env.txs), "blobs", env.blobs, "gas", block.GasUsed(), "fees", feesInEther, "elapsed", common.PrettyDuration(time.Since(start)))
 
 		case <-w.exitCh:
 			log.Info("Worker has exited")

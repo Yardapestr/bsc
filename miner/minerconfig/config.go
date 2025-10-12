@@ -27,16 +27,25 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 )
 
+// Default timing configurations
 var (
-	defaultDelayLeftOver         = 50 * time.Millisecond
 	defaultRecommit              = 10 * time.Second
 	defaultMaxWaitProposalInSecs = uint64(45)
-	// default configurations for MEV
-	defaultGreedyMergeTx         bool   = true
-	defaultValidatorCommission   uint64 = 100
-	defaultBidSimulationLeftOver        = 50 * time.Millisecond
-	defaultNoInterruptLeftOver          = 250 * time.Millisecond
-	defaultMaxBidsPerBuilder     uint32 = 2
+
+	defaultDelayLeftOver         = 20 * time.Millisecond
+	defaultBidSimulationLeftOver = 30 * time.Millisecond
+	// Bid simulation speed on mainnet ranges from 400 to 700 mgasps.
+	// Here we assume 500 for estimation.
+	defaultNoInterruptLeftOver = 170 * time.Millisecond // For gas limit 75M
+)
+
+// Other default MEV-related configurations
+var (
+	defaultMevEnabled          = false
+	defaultGreedyMergeTx       = true
+	defaultBuilderFeeCeil      = "0"
+	defaultValidatorCommission = uint64(100)
+	defaultMaxBidsPerBuilder   = uint32(2) // Simple strategy: send one bid early, another near deadline
 )
 
 // Config is the configuration parameters of mining.
@@ -57,7 +66,7 @@ type Config struct {
 
 // DefaultConfig contains default settings for miner.
 var DefaultConfig = Config{
-	GasCeil:  0,
+	GasCeil:  75000000,
 	GasPrice: big.NewInt(params.GWei),
 
 	// The default recommit time is chosen as two seconds since
@@ -80,9 +89,9 @@ type BuilderConfig struct {
 }
 
 type MevConfig struct {
-	Enabled               bool            // Whether to enable Mev or not
+	Enabled               *bool           `toml:",omitempty"` // Whether to enable Mev or not
 	GreedyMergeTx         *bool           `toml:",omitempty"` // Whether to merge local transactions to the bid
-	BuilderFeeCeil        string          // The maximum builder fee of a bid
+	BuilderFeeCeil        *string         `toml:",omitempty"` // The maximum builder fee of a bid
 	SentryURL             string          // The url of Mev sentry
 	Builders              []BuilderConfig // The list of builders
 	ValidatorCommission   *uint64         `toml:",omitempty"` // 100 means the validator claims 1% from block reward
@@ -92,8 +101,9 @@ type MevConfig struct {
 }
 
 var DefaultMevConfig = MevConfig{
-	Enabled:               false,
+	Enabled:               &defaultMevEnabled,
 	GreedyMergeTx:         &defaultGreedyMergeTx,
+	BuilderFeeCeil:        &defaultBuilderFeeCeil,
 	SentryURL:             "",
 	Builders:              nil,
 	ValidatorCommission:   &defaultValidatorCommission,
@@ -123,6 +133,14 @@ func ApplyDefaultMinerConfig(cfg *Config) {
 	}
 
 	// check [Eth.Miner.Mev]
+	if cfg.Mev.Enabled == nil {
+		cfg.Mev.Enabled = &defaultMevEnabled
+		log.Info("ApplyDefaultMinerConfig", "Mev.Enabled", *cfg.Mev.Enabled)
+	}
+	if cfg.Mev.BuilderFeeCeil == nil {
+		cfg.Mev.BuilderFeeCeil = &defaultBuilderFeeCeil
+		log.Info("ApplyDefaultMinerConfig", "Mev.BuilderFeeCeil", *cfg.Mev.BuilderFeeCeil)
+	}
 	if cfg.Mev.GreedyMergeTx == nil {
 		cfg.Mev.GreedyMergeTx = &defaultGreedyMergeTx
 		log.Info("ApplyDefaultMinerConfig", "Mev.GreedyMergeTx", *cfg.Mev.GreedyMergeTx)
